@@ -64,7 +64,24 @@ enum
 #define SENSOR_INTERVAL_APEX5_WIRED_RATE_HZ      970
 #define SENSOR_INTERVAL_APEX5_WIRED_NS          (SDL_NS_PER_SECOND / SENSOR_INTERVAL_APEX5_WIRED_RATE_HZ)
 
+/* Apex 4 sensor calibration, measured against gravity over the wireless dongle.
+   A negative full scale inverts that axis relative to the Vader 3 Pro layout. */
+#define APEX4_SENSOR_RATE_HZ                     750.0f
+#define APEX4_ACCEL_COUNTS_PER_G                 800.0f
+#define APEX4_PITCH_FULL_SCALE_DPS               -11400.0f
+#define APEX4_YAW_FULL_SCALE_DPS                 -13500.0f
+#define APEX4_ROLL_FULL_SCALE_DPS                3250.0f
+
+/* Back buttons are reported separately in D-Input mode, so fold them into standard buttons here.
+   The hint takes a list like "M1=a,M2=b,M3=x,M4=y", using the button labels printed on the controller. */
+#define SDL_HINT_JOYSTICK_FLYDIGI_BACK_BUTTONS   "SDL_JOYSTICK_FLYDIGI_BACK_BUTTONS"
+#define APEX4_DEFAULT_BACK_BUTTONS               "M2=b,M4=a,M3=y,M1=x"
+
 #define FLYDIGI_ACQUIRE_CONTROLLER_HEARTBEAT_TIME  1000 * 30
+
+/* The controller ignores info requests that arrive within about a second of the previous one */
+#define FLYDIGI_V1_INFO_REQUEST_INTERVAL_MS 1200
+#define FLYDIGI_V1_DETECT_TIMEOUT_MS        6000
 
 #define FLYDIGI_V1_CMD_REPORT_ID        0x05
 #define FLYDIGI_V1_HAPTIC_COMMAND       0x0F
@@ -97,6 +114,16 @@ typedef struct
     Uint64 sensor_timestamp_step_ns; // Based on observed rate of receipt of IMU sensor packets.
     float accelScale;
     float gyroScale;
+    float v1PitchScale; // V1 gyro full scale in radians per second, negative to invert, 0 for the default
+    float v1YawScale;
+    float v1RollScale;
+    float sensor_rate_hz; // Reported IMU rate, 0 for the default
+    bool measure_sensor_rate; // Derive the sensor time step from the observed packet rate
+    Uint64 rate_window_start_ns;
+    Uint32 rate_window_packets;
+    const char *default_back_buttons;
+    Uint8 back_button_offset[4]; // Where M1-M4 are folded into in a V1 state packet, 0 for none
+    Uint8 back_button_mask[4];
     Uint64 next_heartbeat;
     Uint64 last_packet;
     Uint8 last_state[USB_PACKET_LENGTH];
@@ -229,8 +256,18 @@ static void HIDAPI_DriverFlydigi_UpdateDeviceIdentity(SDL_HIDAPI_Device *device)
         HIDAPI_SetDeviceName(device, "Flydigi Apex 3");
         break;
     case SDL_FLYDIGI_APEX4:
-        // The Apex 4 controller has sensors, but they're only reported when gyro mouse is enabled
+        // The Apex 4 controller has sensors, but they're only reported when gyro mouse is enabled.
+        // They use the Vader 3 Pro layout, with different scaling.
         HIDAPI_SetDeviceName(device, "Flydigi Apex 4");
+        ctx->sensors_supported = true;
+        ctx->accelScale = SDL_STANDARD_GRAVITY / APEX4_ACCEL_COUNTS_PER_G;
+        ctx->v1PitchScale = DEG2RAD(APEX4_PITCH_FULL_SCALE_DPS);
+        ctx->v1YawScale = DEG2RAD(APEX4_YAW_FULL_SCALE_DPS);
+        ctx->v1RollScale = DEG2RAD(APEX4_ROLL_FULL_SCALE_DPS);
+        ctx->sensor_rate_hz = APEX4_SENSOR_RATE_HZ;
+        ctx->sensor_timestamp_step_ns = (Uint64)(SDL_NS_PER_SECOND / APEX4_SENSOR_RATE_HZ);
+        ctx->measure_sensor_rate = true;
+        ctx->default_back_buttons = APEX4_DEFAULT_BACK_BUTTONS;
         break;
     case SDL_FLYDIGI_APEX5:
         HIDAPI_SetDeviceName(device, "Flydigi Apex 5");
@@ -333,20 +370,26 @@ static bool HIDAPI_DriverFlydigi_InitControllerV1(SDL_HIDAPI_Device *device)
 {
     SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
 
-    // Detecting the Vader 2 can take over 1000 read retries, so be generous here
-    for (int attempt = 0; ctx->deviceID == 0 && attempt < 30; ++attempt) {
-        const Uint8 request[] = { FLYDIGI_V1_CMD_REPORT_ID, FLYDIGI_V1_GET_INFO_COMMAND, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        // This write will occasionally return -1, so ignore failure here and try again
-        (void)HIDAPI_DriverFlydigi_WritePacket(device, request, sizeof(request));
+    // Detecting the Vader 2 can take over 1000 read retries, so be generous here.
+    // Input reports arrive at up to 1000 Hz, so read them as they come in, otherwise the
+    // reply can be dropped from a full queue, and resend slowly enough not to be ignored.
+    const Uint64 deadline = SDL_GetTicks() + FLYDIGI_V1_DETECT_TIMEOUT_MS;
+    Uint64 next_request = 0;
+    while (ctx->deviceID == 0 && SDL_GetTicks() < deadline) {
+        if (SDL_GetTicks() >= next_request) {
+            const Uint8 request[] = { FLYDIGI_V1_CMD_REPORT_ID, FLYDIGI_V1_GET_INFO_COMMAND, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+            // This write will occasionally return -1, so ignore failure here and try again
+            (void)HIDAPI_DriverFlydigi_WritePacket(device, request, sizeof(request));
+            next_request = SDL_GetTicks() + FLYDIGI_V1_INFO_REQUEST_INTERVAL_MS;
+        }
 
         // Read the reply
-        for (int i = 0; i < 100; ++i) {
-            SDL_Delay(1);
-
+        {
             Uint8 data[USB_PACKET_LENGTH];
-            int size = SDL_hid_read_timeout(device->dev, data, sizeof(data), 0);
+            int size = SDL_hid_read_timeout(device->dev, data, sizeof(data), 1);
             if (size < 0) {
-                break;
+                SDL_Delay(1);
+                continue;
             }
             if (size == 0) {
                 continue;
@@ -380,7 +423,6 @@ static bool HIDAPI_DriverFlydigi_InitControllerV1(SDL_HIDAPI_Device *device)
                 }
 
                 // Done!
-                break;
             }
         }
     }
@@ -655,6 +697,55 @@ static void HIDAPI_DriverFlydigi_SetDevicePlayerIndex(SDL_HIDAPI_Device *device,
 {
 }
 
+static void HIDAPI_DriverFlydigi_LoadBackButtonMapping(SDL_DriverFlydigi_Context *ctx)
+{
+    // Offsets and bits of the buttons in a V1 state packet, as read by HandleStatePacketV1()
+    static const struct
+    {
+        const char *name;
+        Uint8 offset;
+        Uint8 mask;
+    } targets[] = {
+        { "a", 9, 0x10 }, { "b", 9, 0x20 }, { "x", 9, 0x80 }, { "y", 10, 0x01 },
+        { "back", 9, 0x40 }, { "start", 10, 0x02 }, { "lb", 10, 0x04 }, { "rb", 10, 0x08 },
+        { "ls", 10, 0x40 }, { "rs", 10, 0x80 }, { "lt", 23, 0xFF }, { "rt", 24, 0xFF },
+        { "up", 9, 0x01 }, { "right", 9, 0x02 }, { "down", 9, 0x04 }, { "left", 9, 0x08 },
+    };
+
+    SDL_zeroa(ctx->back_button_offset);
+    SDL_zeroa(ctx->back_button_mask);
+
+    const char *hint = SDL_GetHint(SDL_HINT_JOYSTICK_FLYDIGI_BACK_BUTTONS);
+    if (!hint) {
+        hint = ctx->default_back_buttons;
+    }
+    if (!hint) {
+        return;
+    }
+
+    char *spec = SDL_strdup(hint);
+    if (!spec) {
+        return;
+    }
+    char *saveptr = NULL;
+    for (char *entry = SDL_strtok_r(spec, ", ", &saveptr); entry; entry = SDL_strtok_r(NULL, ", ", &saveptr)) {
+        char *value = SDL_strchr(entry, '=');
+        if (!value || (entry[0] != 'M' && entry[0] != 'm') || entry[1] < '1' || entry[1] > '4' || value != entry + 2) {
+            continue;
+        }
+        const int index = entry[1] - '1';
+        ++value;
+        for (int i = 0; i < SDL_arraysize(targets); ++i) {
+            if (SDL_strcasecmp(value, targets[i].name) == 0) {
+                ctx->back_button_offset[index] = targets[i].offset;
+                ctx->back_button_mask[index] = targets[i].mask;
+                break;
+            }
+        }
+    }
+    SDL_free(spec);
+}
+
 static bool HIDAPI_DriverFlydigi_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick)
 {
     SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
@@ -662,6 +753,8 @@ static bool HIDAPI_DriverFlydigi_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joy
     SDL_AssertJoysticksLocked();
 
     SDL_zeroa(ctx->last_state);
+
+    HIDAPI_DriverFlydigi_LoadBackButtonMapping(ctx);
 
     // Initialize the joystick capabilities
     joystick->nbuttons = SDL_GAMEPAD_NUM_BASE_FLYDIGI_BUTTONS;
@@ -682,7 +775,10 @@ static bool HIDAPI_DriverFlydigi_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joy
     }
 
     if (ctx->sensors_supported) {
-        const float flSensorRate = ctx->wireless ? (float)SENSOR_INTERVAL_VADER4_PRO_DONGLE_RATE_HZ : (float)SENSOR_INTERVAL_VADER4_PRO_WIRED_RATE_HZ;
+        float flSensorRate = ctx->wireless ? (float)SENSOR_INTERVAL_VADER4_PRO_DONGLE_RATE_HZ : (float)SENSOR_INTERVAL_VADER4_PRO_WIRED_RATE_HZ;
+        if (ctx->sensor_rate_hz > 0.0f) {
+            flSensorRate = ctx->sensor_rate_hz;
+        }
         SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_GYRO, flSensorRate);
         SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL, flSensorRate);
     }
@@ -736,6 +832,7 @@ static bool HIDAPI_DriverFlydigi_SetJoystickSensorsEnabled(SDL_HIDAPI_Device *de
     SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
     if (ctx->sensors_supported) {
         ctx->sensors_enabled = enabled;
+        ctx->rate_window_start_ns = 0;
         return true;
     }
     return SDL_Unsupported();
@@ -747,6 +844,13 @@ static void HIDAPI_DriverFlydigi_HandleStatePacketV1(SDL_Joystick *joystick, SDL
     Uint64 timestamp = SDL_GetTicksNS();
 
     Uint8 extra_button_index = SDL_GAMEPAD_NUM_BASE_FLYDIGI_BUTTONS;
+
+    // Fold pressed back buttons into the buttons they're mapped to
+    for (int i = 0; i < 4; ++i) {
+        if (ctx->back_button_mask[i] && (data[7] & (0x04 << i))) {
+            data[ctx->back_button_offset[i]] |= ctx->back_button_mask[i];
+        }
+    }
 
     if (ctx->last_state[9] != data[9]) {
         Uint8 hat;
@@ -846,18 +950,34 @@ static void HIDAPI_DriverFlydigi_HandleStatePacketV1(SDL_Joystick *joystick, SDL
 
         // Advance the imu sensor time stamp based on the observed rate of receipt of packets in the testcontroller app.
         // This varies between Product ID and connection type.
+        if (ctx->measure_sensor_rate) {
+            // The packet rate varies with the connection, so track the observed rate
+            ++ctx->rate_window_packets;
+            if (!ctx->rate_window_start_ns) {
+                ctx->rate_window_start_ns = timestamp;
+                ctx->rate_window_packets = 0;
+            } else if (timestamp - ctx->rate_window_start_ns >= SDL_NS_PER_SECOND) {
+                const Uint64 step = (timestamp - ctx->rate_window_start_ns) / ctx->rate_window_packets;
+                ctx->sensor_timestamp_step_ns = SDL_clamp(step, SDL_NS_PER_SECOND / 2000, SDL_NS_PER_SECOND / 100);
+                ctx->rate_window_start_ns = timestamp;
+                ctx->rate_window_packets = 0;
+            }
+        }
+
         sensor_timestamp = ctx->sensor_timestamp_ns;
         ctx->sensor_timestamp_ns += ctx->sensor_timestamp_step_ns;
 
         // Pitch and yaw scales may be receiving extra filtering for the sake of bespoke direct mouse output.
         // As result, roll has a different scaling factor than pitch and yaw.
         // These values were estimated using the testcontroller tool in lieux of hard data sheet references.
-        const float flPitchAndYawScale = DEG2RAD(72000.0f);
-        const float flRollScale = DEG2RAD(1200.0f);
+        const float flPitchScale = ctx->v1PitchScale != 0.0f ? ctx->v1PitchScale : DEG2RAD(72000.0f);
+        const float flYawScale = ctx->v1YawScale != 0.0f ? ctx->v1YawScale : DEG2RAD(72000.0f);
+        const float flRollScale = ctx->v1RollScale != 0.0f ? ctx->v1RollScale : DEG2RAD(1200.0f);
 
-        values[0] = HIDAPI_RemapVal(-1.0f * LOAD16(data[26], data[27]), INT16_MIN, INT16_MAX, -flPitchAndYawScale, flPitchAndYawScale);
-        values[1] = HIDAPI_RemapVal(-1.0f * LOAD16(data[18], data[20]), INT16_MIN, INT16_MAX, -flPitchAndYawScale, flPitchAndYawScale);
-        values[2] = HIDAPI_RemapVal(-1.0f * LOAD16(data[29], data[30]), INT16_MIN, INT16_MAX, -flRollScale, flRollScale);
+        // Scale linearly, so that a reading of zero stays zero instead of becoming a small constant rotation
+        values[0] = -1.0f * LOAD16(data[26], data[27]) * flPitchScale / SDL_MAX_SINT16;
+        values[1] = -1.0f * LOAD16(data[18], data[20]) * flYawScale / SDL_MAX_SINT16;
+        values[2] = -1.0f * LOAD16(data[29], data[30]) * flRollScale / SDL_MAX_SINT16;
         SDL_SendJoystickSensor(timestamp, joystick, SDL_SENSOR_GYRO, sensor_timestamp, values, 3);
 
         const float flAccelScale = ctx->accelScale;
